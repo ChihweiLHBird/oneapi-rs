@@ -171,10 +171,14 @@ impl Queue {
     /// Enqueues a kernel object to the queue as an ND-range kernel, using the number of work-items
     /// specified by the [`NdRange`] nd_range.
     ///
+    /// Each [`UsmBox`] argument tracks the kernel, so host access to the box and dropping it wait
+    /// for the kernel to complete.
+    ///
     /// # Safety
     ///
     /// The caller must make sure each argument matches the launched SYCL kernel's
-    /// signature, including their respective size, layout and alignment.
+    /// signature, including their respective size, layout and alignment, and that the kernel
+    /// does not write to a [`UsmBox`] passed by shared reference.
     pub unsafe fn launch<const ARGC: usize, const DIMENSIONS: usize>(
         &mut self,
         nd_range: NdRange<DIMENSIONS>,

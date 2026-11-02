@@ -14,5 +14,5 @@ pub use crate::{
     platform::Platform,
     queue::Queue,
     range::{NdRange, Range},
-    usmbox::{DeviceUsmBox, HostUsmBox, SharedUsmBox, UsmBox},
+    usmbox::{DeviceUsmBox, HostUsmBox, MemoryUses, SharedUsmBox, UsmBox},
 };

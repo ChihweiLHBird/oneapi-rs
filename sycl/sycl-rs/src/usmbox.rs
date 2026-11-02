@@ -42,9 +42,9 @@ use crate::{
 /// specifying an allocator which is used by the SYCL runtime when allocating temporary memory on
 /// the host.
 ///
-/// A `UsmBox` keeps track of the commands that use it, such as copies and fills. Accessing its
-/// contents from the host and dropping it both wait for those commands to complete, so its
-/// memory is not read or freed while a device may still use it.
+/// A `UsmBox` keeps track of the commands that use it, such as kernel launches and copies.
+/// Accessing its contents from the host and dropping it both wait for those commands to
+/// complete, so its memory is not read or freed while a device may still use it.
 pub struct UsmBox<T, A: UsmAlloc> {
     data: NonNull<T>,
     len: usize,
@@ -96,7 +96,10 @@ impl<T, A: UsmAlloc> UsmBox<T, A> {
         self.len
     }
 
-    unsafe fn as_raw_arg_impl(&self) -> &[u8] {
+    /// Returns the bytes of the USM pointer, which is what a kernel receives, and records the
+    /// memory in `uses`.
+    unsafe fn as_raw_arg_impl<'a>(&'a self, uses: &mut MemoryUses<'a>) -> &'a [u8] {
+        uses.pending.push(&self.pending);
         let data_ptr: *const NonNull<_> = &self.data;
         let cast_ptr = data_ptr as *const u8;
         unsafe { slice::from_raw_parts(cast_ptr, std::mem::size_of_val(&cast_ptr)) }
@@ -180,7 +183,11 @@ impl Pending {
 
 /// The USM memory that a command uses. Once the command is enqueued, host access to that
 /// memory and freeing it wait for the command to complete.
-pub(crate) struct MemoryUses<'a> {
+///
+/// Kernel arguments record the memory they refer to in [`KernelArgument::as_raw_arg`]. Only
+/// [`UsmBox`] arguments record memory; other argument types pass `uses` on to the boxes they
+/// hold.
+pub struct MemoryUses<'a> {
     pending: Vec<&'a Pending>,
 }
 
@@ -274,20 +281,22 @@ pub type HostUsmBoxFuture<T> = UsmBoxFuture<T, UsmAllocator<HostAllocator>>;
 pub type SharedUsmBoxFuture<T> = UsmBoxFuture<T, UsmAllocator<SharedAllocator>>;
 pub type DeviceUsmBoxFuture<T> = UsmBoxFuture<T, UsmAllocator<DeviceAllocator>>;
 
+/// A `UsmBox` passed by value is dropped when the launch returns, which waits for the kernel to
+/// complete. Pass a reference to keep the launch asynchronous.
 unsafe impl<T: Pod, A: UsmAlloc> KernelArgument for UsmBox<T, A> {
-    unsafe fn as_raw_arg(&self) -> &[u8] {
-        unsafe { self.as_raw_arg_impl() }
+    unsafe fn as_raw_arg<'a>(&'a self, uses: &mut MemoryUses<'a>) -> &'a [u8] {
+        unsafe { self.as_raw_arg_impl(uses) }
     }
 }
 
 unsafe impl<T: Pod, A: UsmAlloc> KernelArgument for &UsmBox<T, A> {
-    unsafe fn as_raw_arg(&self) -> &[u8] {
-        unsafe { self.as_raw_arg_impl() }
+    unsafe fn as_raw_arg<'a>(&'a self, uses: &mut MemoryUses<'a>) -> &'a [u8] {
+        unsafe { self.as_raw_arg_impl(uses) }
     }
 }
 
 unsafe impl<T: Pod, A: UsmAlloc> KernelArgument for &mut UsmBox<T, A> {
-    unsafe fn as_raw_arg(&self) -> &[u8] {
-        unsafe { self.as_raw_arg_impl() }
+    unsafe fn as_raw_arg<'a>(&'a self, uses: &mut MemoryUses<'a>) -> &'a [u8] {
+        unsafe { self.as_raw_arg_impl(uses) }
     }
 }

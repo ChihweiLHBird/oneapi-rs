@@ -14,6 +14,7 @@ use crate::{
     kernel::{Kernel, KernelArgumentList},
     private::Sealed,
     queue::Queue,
+    usmbox::MemoryUses,
 };
 
 /// `Range` is a 1D, 2D or 3D vector that defines the iteration domain of either a single work-group
@@ -45,7 +46,8 @@ pub trait ValidDimension: Sealed {
     /// # Safety
     ///
     /// Each argument must match the launched SYCL kernel's signature, including its size,
-    /// layout, and alignment.
+    /// layout, and alignment, and the kernel must not write to a
+    /// [`UsmBox`](crate::usmbox::UsmBox) passed by shared reference.
     unsafe fn launch<const ARGC: usize>(
         &self,
         queue: &mut Queue,
@@ -62,7 +64,9 @@ impl ValidDimension for NdRange<1> {
         kernel: &Kernel,
         args: impl KernelArgumentList<ARGC>,
     ) -> Result<Event> {
-        unsafe {
+        let mut uses = MemoryUses::new();
+        let raw_args = unsafe { args.as_raw_arg_list(&mut uses) };
+        uses.enqueue(|| unsafe {
             sycl_rs_sys::queue::ffi::launch_1d(
                 &mut queue.0,
                 types::ffi::Range1 {
@@ -72,10 +76,9 @@ impl ValidDimension for NdRange<1> {
                     data: self.local_size,
                 },
                 &kernel.0,
-                &args.as_raw_arg_list(),
+                &raw_args,
             )
-        }
-        .map(Into::into)
+        })
     }
 }
 
@@ -87,7 +90,9 @@ impl ValidDimension for NdRange<2> {
         kernel: &Kernel,
         args: impl KernelArgumentList<ARGC>,
     ) -> Result<Event> {
-        unsafe {
+        let mut uses = MemoryUses::new();
+        let raw_args = unsafe { args.as_raw_arg_list(&mut uses) };
+        uses.enqueue(|| unsafe {
             sycl_rs_sys::queue::ffi::launch_2d(
                 &mut queue.0,
                 types::ffi::Range2 {
@@ -97,10 +102,9 @@ impl ValidDimension for NdRange<2> {
                     data: self.local_size,
                 },
                 &kernel.0,
-                &args.as_raw_arg_list(),
+                &raw_args,
             )
-        }
-        .map(Into::into)
+        })
     }
 }
 
@@ -112,7 +116,9 @@ impl ValidDimension for NdRange<3> {
         kernel: &Kernel,
         args: impl KernelArgumentList<ARGC>,
     ) -> Result<Event> {
-        unsafe {
+        let mut uses = MemoryUses::new();
+        let raw_args = unsafe { args.as_raw_arg_list(&mut uses) };
+        uses.enqueue(|| unsafe {
             sycl_rs_sys::queue::ffi::launch_3d(
                 &mut queue.0,
                 types::ffi::Range3 {
@@ -122,9 +128,8 @@ impl ValidDimension for NdRange<3> {
                     data: self.local_size,
                 },
                 &kernel.0,
-                &args.as_raw_arg_list(),
+                &raw_args,
             )
-        }
-        .map(Into::into)
+        })
     }
 }

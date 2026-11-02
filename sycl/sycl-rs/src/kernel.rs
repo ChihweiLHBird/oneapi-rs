@@ -6,7 +6,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
 
-use crate::Result;
+use crate::{Result, usmbox::MemoryUses};
 use bytemuck::Pod;
 use sycl_rs_sys::{kernel_bundle::ffi, types};
 
@@ -54,19 +54,22 @@ impl From<cxx::UniquePtr<types::ffi::Kernel>> for Kernel {
 /// # Safety
 ///
 /// A type implementing this trait must mirror the representation and alignment of the
-/// corresponding SYCL kernel argument structure.
+/// corresponding SYCL kernel argument structure. Its [`as_raw_arg`](KernelArgument::as_raw_arg)
+/// must pass `uses` on to the `as_raw_arg` of every [`UsmBox`](crate::usmbox::UsmBox) it refers
+/// to, and any other memory it refers to must stay allocated until the kernel completes.
 pub unsafe trait KernelArgument {
-    /// Converts self to a raw byte representation.
+    /// Converts self to a raw byte representation, and records the USM memory it refers to, if
+    /// any, in `uses`.
     ///
     /// # Safety
     ///
     /// This function returns a reference to raw bytes. These bytes will be passed to FFI
     /// functions. The caller must make sure these functions respect Rust's aliasing rules.
-    unsafe fn as_raw_arg(&self) -> &[u8];
+    unsafe fn as_raw_arg<'a>(&'a self, uses: &mut MemoryUses<'a>) -> &'a [u8];
 }
 
 unsafe impl<T: Pod> KernelArgument for T {
-    unsafe fn as_raw_arg(&self) -> &[u8] {
+    unsafe fn as_raw_arg<'a>(&'a self, _uses: &mut MemoryUses<'a>) -> &'a [u8] {
         bytemuck::bytes_of(self)
     }
 }
@@ -76,26 +79,29 @@ unsafe impl<T: Pod> KernelArgument for T {
 /// # Safety
 ///
 /// A type implementing this trait must mirror the representation and alignment of each
-/// corresponding SYCL kernel argument inside the returned array.
+/// corresponding SYCL kernel argument inside the returned array, and its
+/// [`as_raw_arg_list`](KernelArgumentList::as_raw_arg_list) must pass `uses` on to the
+/// [`KernelArgument::as_raw_arg`] of each argument.
 pub unsafe trait KernelArgumentList<const ARGC: usize> {
-    /// Converts each struct member to a raw byte representation.
+    /// Converts each struct member to a raw byte representation, and records the USM memory
+    /// they refer to in `uses`.
     ///
     /// # Safety
     ///
     /// This function returns references to raw bytes. These bytes will be passed to FFI
     /// functions. The caller must make sure these functions respect Rust's aliasing rules.
-    unsafe fn as_raw_arg_list(&self) -> [&[u8]; ARGC];
+    unsafe fn as_raw_arg_list<'a>(&'a self, uses: &mut MemoryUses<'a>) -> [&'a [u8]; ARGC];
 }
 
 unsafe impl KernelArgumentList<0> for () {
-    unsafe fn as_raw_arg_list(&self) -> [&[u8]; 0] {
+    unsafe fn as_raw_arg_list<'a>(&'a self, _uses: &mut MemoryUses<'a>) -> [&'a [u8]; 0] {
         []
     }
 }
 
 unsafe impl<T: KernelArgument> KernelArgumentList<1> for T {
-    unsafe fn as_raw_arg_list(&self) -> [&[u8]; 1] {
-        [unsafe { self.as_raw_arg() }]
+    unsafe fn as_raw_arg_list<'a>(&'a self, uses: &mut MemoryUses<'a>) -> [&'a [u8]; 1] {
+        [unsafe { self.as_raw_arg(uses) }]
     }
 }
 
