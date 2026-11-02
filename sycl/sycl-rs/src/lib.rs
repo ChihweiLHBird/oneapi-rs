@@ -90,9 +90,11 @@
 //! ```
 //!
 //! # Safety model
-//! - USM allocations are represented by a zero-cost [`UsmBox`](crate::usmbox::UsmBox) type managed
-//!   through RAII.
+//! - USM allocations are represented by a [`UsmBox`](crate::usmbox::UsmBox) type managed through
+//!   RAII.
 //!   - Note: `UsmBox` arrays do not rely on accessors, unlike SYCL buffers.
+//!   - A `UsmBox` keeps track of the commands that use it. Accessing it from the host and
+//!     dropping it both wait for them to complete.
 //! - `UsmBox`es are zero-initialized by default.
 //! - `UsmBox`es can only store types that implement [`bytemuck::Pod`].
 //! - Kernel launch is inherently unsafe. In particular, the caller must ensure that every argument

@@ -19,7 +19,7 @@ use crate::{
     usm::{UsmAlloc, UsmAllocator},
     usmbox::{
         DeviceUsmBox, EnqueuedDeviceUsmBox, EnqueuedHostUsmBox, EnqueuedSharedUsmBox,
-        EnqueuedUsmBox, HostUsmBox, SharedUsmBox, UsmBox,
+        EnqueuedUsmBox, HostUsmBox, MemoryUses, SharedUsmBox, UsmBox,
     },
 };
 
@@ -132,7 +132,6 @@ impl Queue {
         value: i32,
         dep_events: &[&Event],
     ) -> Result<Event> {
-        let ptr = array.get_byte_ptr();
         let num_bytes = array.get_byte_size();
         let dep_events = dep_events
             .iter()
@@ -140,7 +139,9 @@ impl Queue {
                 ptr: (*e).clone().0,
             })
             .collect::<Vec<_>>();
-        unsafe { ffi::memset(&mut self.0, ptr, value, num_bytes, dep_events) }.map(Into::into)
+        let mut uses = MemoryUses::new();
+        let ptr = uses.add(array);
+        uses.enqueue(|| unsafe { ffi::memset(&mut self.0, ptr, value, num_bytes, dep_events) })
     }
 
     /// Submits a barrier to the queue.
@@ -228,16 +229,12 @@ impl Queue {
             .collect::<Vec<_>>();
 
         let num_bytes = src.get_len() * size_of::<T>();
-        unsafe {
-            ffi::memcpy(
-                &mut self.0,
-                dst.get_byte_ptr(),
-                src.get_byte_ptr(),
-                num_bytes,
-                dep_events,
-            )
-        }
-        .map(Into::into)
+        let mut uses = MemoryUses::new();
+        let dst_ptr = uses.add(dst);
+        let src_ptr = uses.add(src);
+        uses.enqueue(|| unsafe {
+            ffi::memcpy(&mut self.0, dst_ptr, src_ptr, num_bytes, dep_events)
+        })
     }
 }
 

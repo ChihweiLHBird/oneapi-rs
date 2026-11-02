@@ -8,6 +8,7 @@
 
 use std::{
     alloc::{Layout, handle_alloc_error},
+    cell::RefCell,
     ops::{Deref, DerefMut},
     pin::Pin,
     ptr::NonNull,
@@ -21,6 +22,7 @@ use pin_project::pin_project;
 use crate::{
     Result,
     event::{Event, EventFuture},
+    info::{self, InfoTarget},
     kernel::KernelArgument,
     usm::{
         DeviceAllocator, HostAccessible, HostAllocator, SharedAllocator, UsmAlloc, UsmAllocator,
@@ -39,11 +41,17 @@ use crate::{
 /// The `UsmBox` struct takes a generic parameter [`UsmAlloc`](`crate::usm::UsmAlloc`) for
 /// specifying an allocator which is used by the SYCL runtime when allocating temporary memory on
 /// the host.
+///
+/// A `UsmBox` keeps track of the commands that use it, such as copies and fills. Accessing its
+/// contents from the host and dropping it both wait for those commands to complete, so its
+/// memory is not read or freed while a device may still use it.
 pub struct UsmBox<T, A: UsmAlloc> {
     data: NonNull<T>,
     len: usize,
     layout: Layout,
     allocator: A,
+    /// The enqueued commands that may still use the memory.
+    pending: Pending,
 }
 
 impl<T, A: UsmAlloc> UsmBox<T, A> {
@@ -61,11 +69,23 @@ impl<T, A: UsmAlloc> UsmBox<T, A> {
             len,
             layout,
             allocator,
+            pending: Pending::default(),
         }
     }
 
-    pub(crate) fn get_byte_ptr(&self) -> *mut u8 {
-        self.data.as_ptr().cast()
+    /// Performs a blocking wait for the enqueued commands that use this `UsmBox` to complete.
+    /// Returns an error if a synchronous SYCL exception occurs.
+    ///
+    /// Host access waits too, but panics on an error. Call this first to handle the error.
+    pub fn wait(&self) -> Result<()> {
+        self.pending.wait()
+    }
+
+    /// Waits for the enqueued commands before host access. Panics on an error, since a command
+    /// may still be running.
+    fn wait_for_host_access(&self) {
+        self.wait()
+            .expect("waiting for the commands that use a UsmBox failed");
     }
 
     pub(crate) fn get_byte_size(&self) -> usize {
@@ -83,24 +103,110 @@ impl<T, A: UsmAlloc> UsmBox<T, A> {
     }
 }
 
+/// Waits for the enqueued commands that use the `UsmBox` before giving access to its contents.
+///
+/// # Panics
+///
+/// Panics if waiting fails. Call [`UsmBox::wait`] first to handle the error.
 impl<T, A: UsmAlloc + HostAccessible> Deref for UsmBox<T, A> {
     type Target = [T];
     fn deref(&self) -> &Self::Target {
+        self.wait_for_host_access();
         unsafe { slice::from_raw_parts(self.data.as_ptr(), self.len) }
     }
 }
 
+/// Waits for the enqueued commands that use the `UsmBox` before giving access to its contents.
+///
+/// # Panics
+///
+/// Panics if waiting fails. Call [`UsmBox::wait`] first to handle the error.
 impl<T, A: UsmAlloc + HostAccessible> DerefMut for UsmBox<T, A> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        self.wait_for_host_access();
         unsafe { slice::from_raw_parts_mut(self.data.as_ptr(), self.len) }
     }
 }
 
+/// Waits for the enqueued commands that use the `UsmBox`, then frees its memory. If waiting
+/// fails, the memory is leaked, since a command may still be using it.
 impl<T, A: UsmAlloc> Drop for UsmBox<T, A> {
     fn drop(&mut self) {
+        if self.wait().is_err() {
+            return;
+        }
         unsafe {
             self.allocator.deallocate(self.data.cast(), self.layout);
         }
+    }
+}
+
+/// The enqueued commands that may still use a USM allocation.
+#[derive(Default)]
+struct Pending(RefCell<Vec<Event>>);
+
+impl Pending {
+    /// Records a command that uses the allocation.
+    fn add(&self, event: &Event) {
+        let mut events = self.0.borrow_mut();
+        // Forget the completed commands only once the list is full, and leave room for as many
+        // new ones as are still pending, so that recording a command takes amortized constant
+        // time even when many are in flight.
+        if events.len() == events.capacity() {
+            events.retain(|command| {
+                command.get_info::<info::event::CommandExecutionStatus>()
+                    != info::EventCommandStatus::Complete
+            });
+            let still_pending = events.len();
+            events.reserve(still_pending);
+        }
+        events.push(event.clone());
+    }
+
+    /// Waits for the recorded commands to complete. A command whose wait fails stays recorded,
+    /// since it may still be running.
+    fn wait(&self) -> Result<()> {
+        loop {
+            let Some(mut event) = self.0.borrow_mut().pop() else {
+                return Ok(());
+            };
+            if let Err(error) = event.wait() {
+                self.0.borrow_mut().push(event);
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// The USM memory that a command uses. Once the command is enqueued, host access to that
+/// memory and freeing it wait for the command to complete.
+pub(crate) struct MemoryUses<'a> {
+    pending: Vec<&'a Pending>,
+}
+
+impl<'a> MemoryUses<'a> {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    /// Adds `array` to the memory the command uses, and returns the pointer to pass to it.
+    pub(crate) fn add<T, A: UsmAlloc>(&mut self, array: &'a UsmBox<T, A>) -> *mut u8 {
+        self.pending.push(&array.pending);
+        array.data.as_ptr().cast()
+    }
+
+    /// Enqueues the command with `enqueue`, then records it for all the memory it uses.
+    pub(crate) fn enqueue<E: Into<Event>>(
+        self,
+        enqueue: impl FnOnce() -> Result<E>,
+    ) -> Result<Event> {
+        let event = enqueue()?.into();
+        for pending in self.pending {
+            pending.add(&event);
+        }
+        Ok(event)
     }
 }
 
@@ -124,7 +230,7 @@ impl<T, A: UsmAlloc> EnqueuedUsmBox<T, A> {
     /// Performs a blocking wait for the [`UsmBox`] initialization to complete. Returns an error if
     /// a synchronous SYCL exception occurs.
     ///
-    /// Dropping an enqueued array does not wait for its completion.
+    /// Dropping an enqueued array waits for its initialization to complete, then frees it.
     pub fn wait(mut self) -> Result<UsmBox<T, A>> {
         self.event.wait().map(|_| self.array)
     }
